@@ -69,6 +69,7 @@ class CodeTransformer(object, metaclass=ABCMeta):
 
     def visit_generic(self, instr):
         if instr is None:
+            yield None
             return
 
         yield from getattr(self, 'visit_' + instr.opname, lambda *a: a)(instr)
@@ -126,7 +127,9 @@ class CodeTransformer(object, metaclass=ABCMeta):
             co.co_nlocals,
             co.co_stacksize + self.stack_modifier,
             co.co_flags,
-            b''.join(instr.to_bytecode(self) for instr in self),
+            b''.join(
+                (instr or b'') and instr.to_bytecode(self) for instr in self
+            ),
             tuple(sorted(self._consts, key=lambda c: self._consts[c])),
             tuple(self.visit_name(n) for n in co.co_names),
             tuple(self.visit_varname(n) for n in co.co_varnames),
@@ -155,6 +158,7 @@ class Instruction(object):
         self.arg = arg
         self.reljmp = False
         self.absjmp = False
+        self._stolen = None
 
     def _with_jmp_arg(self, transformer):
         """
@@ -179,10 +183,10 @@ class Instruction(object):
         arg = self.arg
         if isinstance(arg, Instruction):
             if self.absjmp:
-                bs += arg.index(transformer).to_bytes(2, 'little')
+                bs += arg.jmp_index(transformer).to_bytes(2, 'little')
             elif self.reljmp:
                 bs += (
-                    arg.index(transformer) - self.index(transformer)
+                    arg.jmp_index(transformer) - self.index(transformer)
                 ).to_bytes(2, 'little')
             else:
                 raise ValueError('must be relative or absolute jump')
@@ -193,6 +197,9 @@ class Instruction(object):
     def index(self, transformer):
         return transformer.index(self)
 
+    def jmp_index(self, transformer):
+        return transformer.index(self._stolen or self)
+
     def __repr__(self):
         arg = self.arg
         return '<{cls}: {opname}{arg}>'.format(
@@ -200,6 +207,10 @@ class Instruction(object):
             opname=self.opname,
             arg=': ' + str(arg) if self.arg is not None else '',
         )
+
+    def steal(self, instr):
+        instr._stolen = self
+        return self
 
 
 def _lazy_is(a, b, *, is_=is_):
@@ -215,8 +226,8 @@ class LazyTransformer(CodeTransformer):
     def stack_modifier(self):
         return 1
 
-    def visit_CONST(self, const):
-        const = super().visit_CONST(const)
+    def visit_const(self, const):
+        const = super().visit_const(const)
         if not isinstance(const, CodeType):
             const = thunk.fromvalue(const)
         return const
@@ -228,7 +239,9 @@ class LazyTransformer(CodeTransformer):
         """
         Functions should have strict names.
         """
-        yield Instruction(ops.LOAD_CONST, self.const_index(strict))
+        yield Instruction(
+            ops.LOAD_CONST, self.const_index(strict)
+        ).steal(instr)
         # TOS = strict
         # TOS1 = func_name
 
@@ -248,7 +261,9 @@ class LazyTransformer(CodeTransformer):
         """
         Loading a name immediatly wraps it in a `thunk`.
         """
-        yield Instruction(ops.LOAD_CONST, self.const_index(thunk.fromvalue))
+        yield Instruction(
+            ops.LOAD_CONST, self.const_index(thunk.fromvalue)
+        ).steal(instr)
         # TOS = thunk.fromvalue
 
         yield instr
@@ -269,7 +284,9 @@ class LazyTransformer(CodeTransformer):
             yield from self.visit_generic(instr)
             return
 
-        yield Instruction(ops.LOAD_CONST, self.const_index(_lazy_is))
+        yield Instruction(
+            ops.LOAD_CONST, self.const_index(_lazy_is)
+        ).steal(instr)
         # TOS = _lazy_is
         # TOS1 = a
         # TOS2 = b
@@ -291,7 +308,9 @@ class LazyTransformer(CodeTransformer):
         represent.
         This makes `not` lazy.
         """
-        yield Instruction(ops.LOAD_CONST, self.const_index(_lazy_not))
+        yield Instruction(
+            ops.LOAD_CONST, self.const_index(_lazy_not)
+        ).steal(instr)
         # TOS = _lazy_not
         # TOS1 = arg
 
